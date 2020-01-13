@@ -1,276 +1,161 @@
+/*
+    This file is part of Leela Zero.
+    Copyright (C) 2017-2018 Gian-Carlo Pascutto
+    Copyright (C) 2017-2018 Marco Calignano
+
+    Leela Zero is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    Leela Zero is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with Leela Zero.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 #include <QtCore/QCoreApplication>
 #include <QtCore/QTimer>
 #include <QtCore/QTextStream>
 #include <QtCore/QStringList>
-#include <QtCore/QPair>
-#include <QtCore/QVector>
+#include <QCommandLineParser>
 #include <QProcess>
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
-#include <QRegularExpression>
-#include <QUuid>
+#include <QtWidgets/QShortcut>
 #include <QDebug>
+#include <chrono>
+#ifdef WIN32
+#include <direct.h>
+#endif
+#include <QCommandLineParser>
 #include <iostream>
-#include <functional>
+#include "Game.h"
+#include "Management.h"
+#include "Console.h"
 
-bool waitForReadyRead(QProcess& process) {
-    while (!process.canReadLine() && process.state() == QProcess::Running) {
-        process.waitForReadyRead(-1);
-    }
-
-    // somebody crashed
-    if (process.state() != QProcess::Running) {
-        return false;
-    }
-
-    return true;
-}
-
-bool sendGtpCommand(QProcess& proc, QString cmd) {
-    QString cmdEndl(cmd);
-    cmdEndl.append(qPrintable("\n"));
-
-    proc.write(qPrintable(cmdEndl));
-    proc.waitForBytesWritten(-1);
-    if (!waitForReadyRead(proc)) {
-        return false;
-    }
-    char readbuff[256];
-    auto read_cnt = proc.readLine(readbuff, 256);
-    Q_ASSERT(read_cnt > 0);
-    Q_ASSERT(readbuff[0] == '=');
-    // Eat double newline from GTP protocol
-    if (!waitForReadyRead(proc)) {
-        return false;
-    }
-    read_cnt = proc.readLine(readbuff, 256);
-    Q_ASSERT(read_cnt > 0);
-    return true;
-}
-
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
-    QTimer::singleShot(0, &app, SLOT(quit()));
+    app.setApplicationName("autogtp");
+    app.setApplicationVersion(QString("v%1").arg(AUTOGTP_VERSION));
+
+    QCommandLineParser parser;
+    parser.addHelpOption();
+    parser.addVersionOption();
+
+    QCommandLineOption gamesNumOption(
+        {"g", "gamesNum"},
+              "Play 'gamesNum' games on one device (GPU/CPU) at the same time.",
+              "num", "1");
+    QCommandLineOption gpusOption(
+        {"u", "gpus"},
+              "Index of the device(s) to use for multiple devices support.",
+              "num");
+    QCommandLineOption keepSgfOption(
+        {"k", "keepSgf" },
+              "Save SGF files after each self-play game.",
+              "output directory");
+    QCommandLineOption keepDebugOption(
+        { "d", "debug" }, "Save training and extra debug files after each self-play game.",
+                          "output directory");
+    QCommandLineOption timeoutOption(
+        { "t", "timeout" }, "Save running games after the timeout (in minutes) is passed and then exit.",
+                          "time in minutes");
+
+    QCommandLineOption singleOption(
+        { "s", "single" }, "Exit after the first game is completed.",
+                          "");
+
+    QCommandLineOption maxOption(
+        { "m", "maxgames" }, "Exit after the given number of games is completed.",
+                          "max number of games");
+
+    QCommandLineOption eraseOption(
+        { "e", "erase" }, "Erase old networks when new ones are available.",
+                          "");
+
+    parser.addOption(gamesNumOption);
+    parser.addOption(gpusOption);
+    parser.addOption(keepSgfOption);
+    parser.addOption(keepDebugOption);
+    parser.addOption(timeoutOption);
+    parser.addOption(singleOption);
+    parser.addOption(maxOption);
+    parser.addOption(eraseOption);
+
+    // Process the actual command line arguments given by the user
+    parser.process(app);
+    int gamesNum = parser.value(gamesNumOption).toInt();
+    QStringList gpusList = parser.values(gpusOption);
+    int gpusNum = gpusList.count();
+    if (gpusNum == 0) {
+        gpusNum = 1;
+    }
+    int maxNum = -1;
+    if (parser.isSet(maxOption)) {
+        maxNum = parser.value(maxOption).toInt();
+        if (maxNum == 0) {
+            maxNum = 1;
+        }
+        if (maxNum < gpusNum * gamesNum) {
+            gamesNum = maxNum / gpusNum;
+            if (gamesNum == 0) {
+                gamesNum = 1;
+                gpusNum = 1;
+            }
+        }
+        maxNum -= (gpusNum * gamesNum);
+    }
+    if (parser.isSet(singleOption)) {
+        gamesNum = 1;
+        gpusNum = 1;
+        maxNum = 0;
+    }
 
     // Map streams
-    QTextStream cin(stdin, QIODevice::ReadOnly);
-    QTextStream cout(stdout, QIODevice::WriteOnly);
-#if defined(LOG_ERRORS_TO_FILE)
-    // Log stderr to file
-    QFile caFile("output.txt");
-    caFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append);
-    if(!caFile.isOpen()){
-        qDebug() << "- Error, unable to open" << "outputFilename" << "for output";
-    }
-    QTextStream cerr(&caFile);
-#else
     QTextStream cerr(stderr, QIODevice::WriteOnly);
-#endif
-
-    cerr << "autogtp v0.1" << endl;
-
-    QStringList slargs = app.arguments();
-
-    if (slargs.size() > 1) {
-        cerr << "Invalid number of arguments (" << slargs.size() << ")" << endl;
-        exit(EXIT_FAILURE);
-    }
-
-    QString prog_cmdline("./leelaz");
-#ifdef WIN32
-    prog_cmdline.append(".exe");
-#endif
-    prog_cmdline.append(" -g -n -m 30 -r 0 -w weights.txt -p 800 --noponder");
-
-    cerr << prog_cmdline << endl;
-
-    QProcess first_process, second_process;
-    first_process.start(prog_cmdline);
-    second_process.start(prog_cmdline);
-
-    first_process.waitForStarted();
-    second_process.waitForStarted();
-
-    char readbuff[256];
-    int read_cnt;
-
-    QString winner;
-    bool stop = false;
-    bool black_to_move = true;
-    bool black_resigned = false;
-    bool first_to_move = true;
-    int passes = 0;
-    int move_num = 0;
-
-    // Set infinite time
-    if (!sendGtpCommand(first_process,
-                        QStringLiteral("time_settings 0 1 0"))) {
-        exit(EXIT_FAILURE);
-    }
-    if (!sendGtpCommand(second_process,
-                        QStringLiteral("time_settings 0 1 0"))) {
-        exit(EXIT_FAILURE);
-    }
-    cerr << "Time successfully set." << endl;
-
-    do {
-        move_num++;
-        QString move_cmd;
-        if (black_to_move) {
-            move_cmd = "genmove b\n";
-        } else {
-            move_cmd = "genmove w\n";
-        }
-        /// Send genmove to the right process
-        auto proc = std::ref(first_process);
-        if (!first_to_move) {
-            proc = std::ref(second_process);
-        }
-        proc.get().write(qPrintable(move_cmd));
-        proc.get().waitForBytesWritten(-1);
-        if (!waitForReadyRead(proc)) {
-            exit(EXIT_FAILURE);
-        }
-        // Eat response
-        read_cnt = proc.get().readLine(readbuff, 256);
-        if (read_cnt <= 3 || readbuff[0] != '=') {
-            cerr << "Error read " << read_cnt
-                 << " '" << readbuff << "'" << endl;
-            second_process.terminate();
-            first_process.terminate();
-            exit(EXIT_FAILURE);
-        }
-        // Skip "= "
-        QString resp_move(&readbuff[2]);
-        resp_move = resp_move.simplified();
-
-        // Eat double newline from GTP protocol
-        if (!waitForReadyRead(proc)) {
-            exit(EXIT_FAILURE);
-        }
-        read_cnt = proc.get().readLine(readbuff, 256);
-        Q_ASSERT(read_cnt > 0);
-
-        cerr << "Move received: " << resp_move << endl;
-
-        QString move_side(QStringLiteral("play "));
-        QString side_prefix;
-
-        if (black_to_move) {
-            side_prefix = QStringLiteral("b ");
-        } else {
-            side_prefix = QStringLiteral("w ");
-        }
-
-        move_side += side_prefix + resp_move + "\n";
-
-        if (resp_move.compare(QStringLiteral("pass"),
-                              Qt::CaseInsensitive) == 0) {
-            passes++;
-        } else if (resp_move.compare(QStringLiteral("resign"),
-                                     Qt::CaseInsensitive) == 0) {
-            passes++;
-            stop = true;
-            black_resigned = black_to_move;
-        } else {
-            passes = 0;
-        }
-
-        // Got move, swap sides now
-        first_to_move = !first_to_move;
-        black_to_move = !black_to_move;
-
-        if (!stop) {
-            auto next = std::ref(first_process);
-            if (!first_to_move) {
-                next = std::ref(second_process);
-            }
-            if (!sendGtpCommand(next, qPrintable(move_side))) {
-                exit(EXIT_FAILURE);
-            }
-        }
-    } while (!stop && passes < 2 && move_num < (19 * 19 * 2));
-
-    // Nobody resigned, we will have to count
-    if (!stop) {
-        // Ask for the winner
-        first_process.write(qPrintable("final_score\n"));
-        first_process.waitForBytesWritten(-1);
-        if (!waitForReadyRead(first_process)) {
-            exit(EXIT_FAILURE);
-        }
-        read_cnt = first_process.readLine(readbuff, 256);
-        QString score(&readbuff[2]);
-        cerr << "Score: " << score;
-        // final_score returns
-        // "= W+" or "= B+"
-        if (readbuff[2] == 'W') {
-            winner = QString(QStringLiteral("white"));
-        } else if (readbuff[2] == 'B') {
-            winner = QString(QStringLiteral("black"));
-        }
-        cerr << "Winner: " << winner << endl;
-        // Double newline
-        if (!waitForReadyRead(first_process)) {
-            exit(EXIT_FAILURE);
-        }
-        read_cnt = first_process.readLine(readbuff, 256);
-        Q_ASSERT(read_cnt > 0);
-    } else {
-        if (black_resigned) {
-            winner = QString(QStringLiteral("white"));
-        } else {
-            winner = QString(QStringLiteral("black"));
+    cerr << "AutoGTP v" << AUTOGTP_VERSION << endl;
+    cerr << "Using " << gamesNum << " game thread(s) per device." << endl;
+    if (parser.isSet(keepSgfOption)) {
+        if (!QDir().mkpath(parser.value(keepSgfOption))) {
+            cerr << "Couldn't create output directory for self-play SGF files!"
+                 << endl;
+            return EXIT_FAILURE;
         }
     }
-
-    if (winner.isNull()) {
-        cerr << "No winner found" << endl;
-        first_process.write(qPrintable("quit\n"));
-        second_process.write(qPrintable("quit\n"));
-
-        first_process.waitForFinished(-1);
-        second_process.waitForFinished(-1);
-        exit(EXIT_FAILURE);
+    if (parser.isSet(keepDebugOption)) {
+        if (!QDir().mkpath(parser.value(keepDebugOption))) {
+            cerr << "Couldn't create output directory for self-play Debug files!"
+                 << endl;
+            return EXIT_FAILURE;
+        }
     }
-
-    // Write the game SGF
-    QString sgf_name, training_name;
-    QString random_name(QUuid::createUuid().toRfc4122().toHex());
-
-    sgf_name += random_name;
-    sgf_name += ".sgf";
-    training_name += random_name;
-    training_name += ".txt";
-
-    cerr << "Writing " << sgf_name << endl;
-
-    if (!sendGtpCommand(first_process,
-                        qPrintable("printsgf " + sgf_name + "\n"))) {
-        exit(EXIT_FAILURE);
+    Console *cons = nullptr;
+    if (!QDir().mkpath("networks")) {
+        cerr << "Couldn't create the directory for the networks files!"
+             << endl;
+        return EXIT_FAILURE;
     }
-
-    QString dump_cmd(qPrintable("dump_training " + winner +
-                     " " + training_name + "\n"));
-    cerr << dump_cmd;
-
-    // Now dump the training
-    if (!sendGtpCommand(first_process, dump_cmd)) {
-        exit(EXIT_FAILURE);
+    Management *boss = new Management(gpusNum, gamesNum, gpusList, AUTOGTP_VERSION, maxNum,
+                                      parser.isSet(eraseOption), parser.value(keepSgfOption),
+                                      parser.value(keepDebugOption));
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, boss, &Management::storeGames);
+    QTimer *timer = new QTimer();
+    boss->giveAssignments();
+    if (parser.isSet(timeoutOption)) {
+        QObject::connect(timer, &QTimer::timeout, &app, &QCoreApplication::quit);
+        timer->start(parser.value(timeoutOption).toInt() * 60000);
     }
-    if (!sendGtpCommand(second_process, dump_cmd)) {
-        exit(EXIT_FAILURE);
+    if (parser.isSet(singleOption) || parser.isSet(maxOption)) {
+        QObject::connect(boss, &Management::sendQuit, &app, &QCoreApplication::quit);
     }
-
-    // Close down
-    first_process.write(qPrintable("quit\n"));
-    second_process.write(qPrintable("quit\n"));
-
-    first_process.waitForFinished(-1);
-    second_process.waitForFinished(-1);
-
-    cerr.flush();
-    cout.flush();
+    if (true) {
+        cons = new Console();
+        QObject::connect(cons, &Console::sendQuit, &app, &QCoreApplication::quit);
+    }
     return app.exec();
 }
